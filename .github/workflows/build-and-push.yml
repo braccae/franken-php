@@ -103,7 +103,7 @@ jobs:
 
       - name: Create and push manifest
         run: |
-          for TAG in ${{ steps.meta.outputs.tags }}; do
+          for TAG in ${DOCKER_METADATA_OUTPUT_TAGS}; do
             docker manifest create "$TAG" "${TAG}-amd64" "${TAG}-arm64"
             docker manifest push "$TAG"
           done
