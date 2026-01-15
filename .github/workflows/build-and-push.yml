@@ -2,108 +2,206 @@ name: Build and Push Container
 
 on:
   push:
-    branches:
-      - main
-      - master
-    tags:
-      - 'v*'
+    branches: ["main", "master"]
+    paths:
+      - "Containerfile"
+      - ".github/workflows/build-and-push.yml"
   pull_request:
-    branches:
-      - main
-      - master
+    branches: ["main", "master"]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 5 1/4 * *"
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  IMAGE_NAME_BASE: "franken-php"
+  VARIENT: latest
+  IMAGE_DESC: "FrankenPHP container image"
+  ARTIFACTHUB_LOGO_URL: "https://avatars.githubusercontent.com/u/23002397?v=4&size=64"
 
 jobs:
-  build:
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      matrix:
-        include:
-          - runner: ubuntu-latest
-            platform: linux/amd64
-            arch: amd64
-          - runner: ubuntu-24.04-arm
-            platform: linux/arm64
-            arch: arm64
-    permissions:
-      contents: read
-      packages: write
-
+  build-metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      tags: ${{ steps.meta.outputs.tags }}
+      labels: ${{ steps.meta.outputs.labels }}
+      image_name: ${{ steps.set_image_name.outputs.IMAGE_NAME }}
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Get current date
+        id: date
+        run: |
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
 
-      - name: Log in to Container Registry
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set Image Name and Tag
+        id: set_image_name
+        run: |
+          BRANCH_NAME="${GITHUB_REF#refs/heads/}"
+          if [[ "$BRANCH_NAME" == "main" || "$BRANCH_NAME" == "master" ]]; then
+            IMAGE_NAME="${{ env.IMAGE_NAME_BASE }}"
+            TAG=${{ env.VARIENT }}
+          else
+            IMAGE_NAME="${{ env.IMAGE_NAME_BASE }}-${BRANCH_NAME}"
+            TAG="$BRANCH_NAME"
+          fi
+          echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "TAG=$TAG" >> $GITHUB_OUTPUT
+          echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_ENV
+          echo "DEFAULT_TAG=$TAG" >> $GITHUB_ENV
 
-      - name: Extract metadata
+      - name: Extract metadata for Docker
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          flavor: |
-            suffix=-${{ matrix.arch }}
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ steps.set_image_name.outputs.IMAGE_NAME }}
           tags: |
+            type=raw,value=${{ env.VARIENT }},enable=${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+            type=sha,format=short
             type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=pr
+            type=schedule,pattern={{date 'YYYYMMDD'}}
+          labels: |
+            org.opencontainers.image.created=${{ steps.date.outputs.date }}
+            org.opencontainers.image.description=${{ env.IMAGE_DESC }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.title=${{ steps.set_image_name.outputs.IMAGE_NAME }}
+            org.opencontainers.image.url=https://github.com/${{ github.repository }}
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+            org.opencontainers.image.version=${{ env.DEFAULT_TAG }}
+            io.artifacthub.package.license=MIT
+          sep-tags: " "
+          sep-annotations: " "
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Containerfile
-          platforms: ${{ matrix.platform }}
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  create-manifest:
-    if: github.event_name != 'pull_request'
-    needs: build
-    runs-on: ubuntu-latest
+  build:
+    runs-on: ${{ matrix.runner }}
+    needs: build-metadata
     permissions:
       contents: read
       packages: write
-
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
     steps:
-      - name: Log in to Container Registry
-        uses: docker/login-action@v3
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: redhat-actions/podman-login@v1
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
+      - name: Build Image
+        uses: redhat-actions/buildah-build@v2
+        id: build
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha
-            type=raw,value=latest,enable={{is_default_branch}}
+          context: .
+          containerfiles: ./Containerfile
+          platforms: ${{ matrix.platform }}
+          image: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ needs.build-metadata.outputs.image_name }}
+          tags: ${{ needs.build-metadata.outputs.tags }}
+          labels: ${{ needs.build-metadata.outputs.labels }}
 
-      - name: Create and push manifest
+      - name: Push To Registry
+        if: github.event_name != 'pull_request'
+        uses: redhat-actions/push-to-registry@v2
+        id: push
+        with:
+          image: ${{ steps.build.outputs.image }}
+          tags: ${{ steps.build.outputs.tags }}
+
+      - name: Upload build info
+        if: github.event_name != 'pull_request'
         run: |
-          for TAG in ${DOCKER_METADATA_OUTPUT_TAGS}; do
-            docker manifest create "$TAG" "${TAG}-amd64" "${TAG}-arm64"
-            docker manifest push "$TAG"
+          mkdir -p build-info
+          echo "${{ steps.push.outputs.digest }}" > build-info/digest.txt
+          echo "${{ matrix.platform }}" > build-info/platform.txt
+        id: build-info
+
+      - name: Upload artifact for manifest creation
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-info-${{ matrix.arch }}
+          path: build-info/
+
+  create-manifest:
+    runs-on: ubuntu-latest
+    needs: [build-metadata, build]
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: redhat-actions/podman-login@v1
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download amd64 build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-info-amd64
+          path: artifacts/build-info-amd64/
+
+      - name: Download arm64 build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-info-arm64
+          path: artifacts/build-info-arm64/
+
+      - name: Read build info
+        id: read-build-info
+        run: |
+          AMD64_DIGEST=$(cat artifacts/build-info-amd64/digest.txt)
+          ARM64_DIGEST=$(cat artifacts/build-info-arm64/digest.txt)
+          echo "amd64_digest=$AMD64_DIGEST" >> $GITHUB_OUTPUT
+          echo "arm64_digest=$ARM64_DIGEST" >> $GITHUB_OUTPUT
+
+      - name: Create and push multi-arch manifest
+        id: push-manifest
+        run: |
+          REPOSITORY="${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ needs.build-metadata.outputs.image_name }}"
+          for IMAGE_TAG in ${{ needs.build-metadata.outputs.tags }}; do
+            echo "Creating and pushing manifest for $IMAGE_TAG"
+            podman manifest create "$IMAGE_TAG"
+            podman manifest add "$IMAGE_TAG" \
+              --arch amd64 \
+              --os linux \
+              "$REPOSITORY@${{ steps.read-build-info.outputs.amd64_digest }}"
+            podman manifest add "$IMAGE_TAG" \
+              --arch arm64 \
+              --os linux \
+              "$REPOSITORY@${{ steps.read-build-info.outputs.arm64_digest }}"
+            DIGEST=$(podman manifest push "$IMAGE_TAG")
+            TAG="${IMAGE_TAG##*:}"
+            if [[ "$TAG" == "${{ env.VARIENT }}" ]]; then
+              echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+            fi
           done
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3.7.0
+
+      - name: Sign multi-arch manifest
+        if: env.HAS_SIGNING_SECRET == 'true'
+        run: |
+          REPOSITORY="${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ needs.build-metadata.outputs.image_name }}"
+          cosign sign -y --key env://COSIGN_PRIVATE_KEY "${REPOSITORY}:${{ env.VARIENT }}"
+        env:
+          COSIGN_EXPERIMENTAL: false
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          HAS_SIGNING_SECRET: ${{ secrets.SIGNING_SECRET != '' }}
