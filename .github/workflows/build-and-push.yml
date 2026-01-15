@@ -52,11 +52,14 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: |
+            suffix=-${{ matrix.arch }}
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha-${{ matrix.arch }}
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
@@ -100,18 +103,7 @@ jobs:
 
       - name: Create and push manifest
         run: |
-          # Get the base tags (without the arch suffix)
-          TAGS="${{ steps.meta.outputs.tags }}"
-          
-          for TAG in $TAGS; do
-            # Remove arch suffix if present
-            BASE_TAG=$(echo "$TAG" | sed 's/-amd64$//' | sed 's/-arm64$//')
-            
-            # Create manifest combining both architectures
-            docker manifest create "$BASE_TAG" \
-              "${{ env.REGISTRY }}/${{ github.repository }}:${BASE_TAG##*/}-amd64" \
-              "${{ env.REGISTRY }}/${{ github.repository }}:${BASE_TAG##*/}-arm64" || true
-            
-            # Push the manifest
-            docker manifest push "$BASE_TAG" || true
+          for TAG in ${{ steps.meta.outputs.tags }}; do
+            docker manifest create "$TAG" "${TAG}-amd64" "${TAG}-arm64"
+            docker manifest push "$TAG"
           done
